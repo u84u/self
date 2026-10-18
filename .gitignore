@@ -1,0 +1,15 @@
+# Build artifacts
+/build/
+/dist/
+
+# Customer key material never belongs in git
+/keys/
+
+# No documentation or planning artifacts
+/docs/
+/plans/
+
+# Test residue
+*.test
+coverage.out
+/tmp/
