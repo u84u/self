@@ -5,12 +5,18 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/u84u/self/internal/format"
 )
 
 // writeKey marshals key into OpenSSH format and writes it to dir/name.
@@ -101,6 +107,83 @@ func TestIdentitiesSkipsJunkFiles(t *testing.T) {
 	}
 	if len(identities) != 0 {
 		t.Fatalf("Identities returned %d identities from junk only, want 0", len(identities))
+	}
+}
+
+// capabilityPlain builds the plaintext tail the packer writes for a
+// capability token: marker, payload+signature, then the 4-byte length.
+func capabilityPlain(payload, sig []byte) []byte {
+	token := append(append([]byte{}, payload...), sig...)
+	plain := []byte("payload bytes")
+	plain = append(plain, []byte(format.CapabilityMarker)...)
+	plain = append(plain, token...)
+	var l [4]byte
+	binary.LittleEndian.PutUint32(l[:], uint32(len(token)))
+	return append(plain, l[:]...)
+}
+
+func TestVerifyCapabilityAcceptsIssuerToken(t *testing.T) {
+	_, issuer, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetIssuerPublicKey(hex.EncodeToString(issuer.Public().(ed25519.PublicKey)))
+	defer SetIssuerPublicKey("")
+
+	payload := []byte(fmt.Sprintf("alice|%d|%d", time.Now().Unix(), time.Now().Add(time.Hour).Unix()))
+	sig := ed25519.Sign(issuer, payload)
+	if err := VerifyCapability(capabilityPlain(payload, sig)); err != nil {
+		t.Fatalf("VerifyCapability: %v", err)
+	}
+}
+
+// TestVerifyCapabilityRejectsForeignKey is the negative test for the
+// forgery bug: a token signed by a key other than the compiled-in issuer
+// must be rejected even though the signer supplied its own public key.
+func TestVerifyCapabilityRejectsForeignKey(t *testing.T) {
+	_, issuer, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attacker, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetIssuerPublicKey(hex.EncodeToString(issuer.Public().(ed25519.PublicKey)))
+	defer SetIssuerPublicKey("")
+
+	payload := []byte(fmt.Sprintf("alice|%d|%d", time.Now().Unix(), time.Now().Add(time.Hour).Unix()))
+	sig := ed25519.Sign(attacker, payload)
+	if err := VerifyCapability(capabilityPlain(payload, sig)); err == nil {
+		t.Fatal("VerifyCapability accepted a token signed by a foreign key")
+	}
+}
+
+func TestVerifyCapabilityFailsClosedWithoutKey(t *testing.T) {
+	SetIssuerPublicKey("")
+	_, issuer, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(fmt.Sprintf("alice|%d|%d", time.Now().Unix(), time.Now().Add(time.Hour).Unix()))
+	sig := ed25519.Sign(issuer, payload)
+	if err := VerifyCapability(capabilityPlain(payload, sig)); err == nil {
+		t.Fatal("VerifyCapability accepted a token with no issuer key compiled in")
+	}
+}
+
+func TestVerifyCapabilityRejectsExpiredToken(t *testing.T) {
+	_, issuer, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetIssuerPublicKey(hex.EncodeToString(issuer.Public().(ed25519.PublicKey)))
+	defer SetIssuerPublicKey("")
+
+	payload := []byte(fmt.Sprintf("alice|%d|%d", time.Now().Add(-2*time.Hour).Unix(), time.Now().Add(-time.Hour).Unix()))
+	sig := ed25519.Sign(issuer, payload)
+	if err := VerifyCapability(capabilityPlain(payload, sig)); err == nil {
+		t.Fatal("VerifyCapability accepted an expired token")
 	}
 }
 

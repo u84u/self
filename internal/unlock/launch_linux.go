@@ -188,28 +188,66 @@ func hardenProcess() {
 		}
 	}
 	_ = unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{Cur: 0, Max: 0})
-	if data, err := os.ReadFile("/proc/self/status"); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "TracerPid:") {
-				fields := strings.Fields(line)
-				if len(fields) > 1 && fields[1] != "0" {
-					unix.Exit(3)
-				}
-			}
+	// The tracer probe and the seccomp filter are the two behaviors
+	// endpoint security tools flag as malware, so they run only when
+	// the operator asks for them.
+	if os.Getenv(AntiDebugEnv) == "1" {
+		refuseIfTraced()
+		blockDebugSyscalls()
+	}
+}
+
+// AntiDebugEnv opts into the TracerPid probe and the seccomp filter that
+// blocks ptrace and process_vm_*. Both are off by default because they
+// trip endpoint security products.
+const AntiDebugEnv = "SELF_ANTI_DEBUG"
+
+// refuseIfTraced exits when /proc/self/status reports a tracer.
+func refuseIfTraced() {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "TracerPid:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) > 1 && fields[1] != "0" {
+			unix.Exit(3)
 		}
 	}
-	// Best-effort seccomp filter blocking ptrace and process_vm_*.
-	_ = unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
-	filter := []unix.SockFilter{
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.SYS_PTRACE)},
-		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | 1}, // EPERM
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.SYS_PROCESS_VM_READV)},
-		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | 1},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.SYS_PROCESS_VM_WRITEV)},
-		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | 1},
-		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+}
+
+// blockDebugSyscalls installs a best-effort seccomp filter that returns
+// EPERM for ptrace and process_vm_*. It compares seccomp_data.arch first
+// and allows everything if the running architecture is not the one whose
+// syscall numbers the filter was built for.
+func blockDebugSyscalls() {
+	if seccompArch == 0 {
+		return
 	}
+	_ = unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+	blocked := []uint32{uint32(unix.SYS_PTRACE), uint32(unix.SYS_PROCESS_VM_READV), uint32(unix.SYS_PROCESS_VM_WRITEV)}
+	filter := make([]unix.SockFilter, 0, 4+2*len(blocked))
+	// struct seccomp_data: nr at offset 0, arch at offset 4.
+	filter = append(filter,
+		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 4},
+		unix.SockFilter{
+			Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K,
+			Jt:   0,
+			Jf:   uint8(1 + 2*len(blocked)), // skip the nr checks to the allow rule
+			K:    seccompArch,
+		},
+		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+	)
+	for _, nr := range blocked {
+		filter = append(filter,
+			unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: nr},
+			unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ERRNO | 1}, // EPERM
+		)
+	}
+	filter = append(filter, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW})
 	prog := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
 	_, _, _ = unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, 0, uintptr(unsafe.Pointer(&prog)))
 }

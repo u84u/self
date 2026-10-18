@@ -43,6 +43,10 @@ const (
 	// FlagCapability indicates an issuer-signed capability token is
 	// appended to the encrypted payload.
 	FlagCapability = uint32(1 << 3)
+
+	// CapabilityMarker separates a capability token from the payload
+	// bytes. The stub only looks for it when FlagCapability is set.
+	CapabilityMarker = "SELF-CAP"
 )
 
 // Footer is the trailer of a packed artifact.

@@ -27,7 +27,7 @@ func launchSpawn(image io.Reader, argv, envv []string) (int, error) {
 		return 0, fmt.Errorf("unlock: temp file: %w", err)
 	}
 	path := f.Name()
-	cleanup := func() { f.Close(); secureRemove(path) }
+	cleanup := func() { f.Close(); removeTemp(path) }
 
 	if err := f.Chmod(0o700); err != nil {
 		cleanup()
@@ -38,7 +38,7 @@ func launchSpawn(image io.Reader, argv, envv []string) (int, error) {
 		return 0, fmt.Errorf("unlock: write payload: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		secureRemove(path)
+		removeTemp(path)
 		return 0, fmt.Errorf("unlock: write payload: %w", err)
 	}
 
@@ -52,15 +52,15 @@ func launchSpawn(image io.Reader, argv, envv []string) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		secureRemove(path)
+		removeTemp(path)
 		return 0, fmt.Errorf("unlock: start payload: %w", err)
 	}
 	// Start waits for exec on POSIX, so unlinking now cannot race it.
-	removed := secureRemove(path)
+	removed := removeTemp(path)
 
 	err = cmd.Wait()
 	if !removed {
-		_ = secureRemove(path)
+		_ = removeTemp(path)
 	}
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) {
@@ -85,28 +85,10 @@ func launchSpawn(image io.Reader, argv, envv []string) (int, error) {
 	return code, nil
 }
 
-// secureRemove overwrites a file with zeros before deleting it, where
-// the path still exists. Best-effort: failures are ignored.
-func secureRemove(path string) bool {
-	removed := false
-	if f, err := os.OpenFile(path, os.O_WRONLY, 0); err == nil {
-		info, _ := f.Stat()
-		if info != nil {
-			buf := make([]byte, 64*1024)
-			var written int64
-			for written < info.Size() {
-				n := int64(len(buf))
-				if remaining := info.Size() - written; remaining < n {
-					n = remaining
-				}
-				if _, err := f.Write(buf[:n]); err != nil {
-					break
-				}
-				written += n
-			}
-		}
-		f.Close()
-	}
-	removed = (os.Remove(path) == nil)
-	return removed
+// removeTemp deletes path and reports whether it is gone. Overwriting
+// the file first would not make the plaintext unrecoverable: the bytes
+// already reached the filesystem and may persist in free blocks,
+// journals, or copy-on-write snapshots.
+func removeTemp(path string) bool {
+	return os.Remove(path) == nil
 }

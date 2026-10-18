@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -93,8 +94,13 @@ func Run() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("unlock: read payload: %w", err)
 	}
-	if err := VerifyCapability(plainBytes); err != nil {
-		return 0, err
+	// Only parse a capability token when the footer says one is present.
+	// Scanning for the marker unconditionally would misread a payload that
+	// happens to contain the bytes "SELF-CAP".
+	if footer.Flags&format.FlagCapability != 0 {
+		if err := VerifyCapability(plainBytes); err != nil {
+			return 0, err
+		}
 	}
 	extraEnv := ExtractEnv(plainBytes, footer)
 	mlockBestEffort(plainBytes)
@@ -123,14 +129,6 @@ func sshDirs() []string {
 		return nil
 	}
 	return []string{filepath.Join(home, ".ssh")}
-}
-
-func sshDir() string {
-	dirs := sshDirs()
-	if len(dirs) == 0 {
-		return ""
-	}
-	return dirs[0]
 }
 
 func debugMode() bool {
@@ -270,43 +268,75 @@ func ExtractEnv(plain []byte, footer format.Footer) []string {
 	return strings.Split(raw, "\x00")
 }
 
-// VerifyCapability checks an issuer-signed capability token appended to
-// the decrypted payload, if present. It returns nil when no token is
-// embedded.
+// issuerPublicKeyHex is the hex-encoded Ed25519 public key capability
+// tokens must be signed with. It is compiled into the stub at build time:
+//
+//	go build -ldflags "-X github.com/u84u/self/internal/unlock.issuerPublicKeyHex=<hex>" ./cmd/stub
+//
+// An empty value rejects every capability token: the key must come from
+// the binary, never from the data the token is meant to authorize.
+var issuerPublicKeyHex string
+
+// SetIssuerPublicKey overrides the compiled-in issuer key. It exists so
+// tests can exercise verification against known keys.
+func SetIssuerPublicKey(hexKey string) { issuerPublicKeyHex = hexKey }
+
+// issuerPublicKey decodes the compiled-in issuer key.
+func issuerPublicKey() (ed25519.PublicKey, error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(issuerPublicKeyHex))
+	if err != nil {
+		return nil, fmt.Errorf("unlock: issuer public key is not hex: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, errors.New("unlock: no issuer public key compiled in")
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// VerifyCapability checks the issuer-signed capability token appended to
+// the decrypted payload. The signature is verified against the issuer key
+// compiled into the stub, so holding a customer key does not let anyone
+// mint a token. It fails closed when no issuer key is present.
+//
+// Callers must only invoke this when the footer's FlagCapability is set.
 func VerifyCapability(plain []byte) error {
-	marker := []byte("SELF-CAP")
-	idx := bytes.LastIndex(plain, marker)
-	if idx < 0 {
-		return nil
+	pub, err := issuerPublicKey()
+	if err != nil {
+		return err
 	}
-	off := idx + len(marker)
-	if len(plain) < off+32+4 {
+	// The packer writes marker | token | token length, so the token is
+	// found from the end without scanning the payload for the marker.
+	marker := []byte(format.CapabilityMarker)
+	minLen := len(marker) + 4 + ed25519.SignatureSize
+	if len(plain) < minLen {
 		return errors.New("unlock: truncated capability token")
 	}
-	pub := plain[off : off+32]
-	off += 32
-	tokenLen := int(binary.LittleEndian.Uint32(plain[off : off+4]))
-	off += 4
-	if len(plain) < off+tokenLen {
+	tokenLen := int(binary.LittleEndian.Uint32(plain[len(plain)-4:]))
+	tokenStart := len(plain) - 4 - tokenLen
+	markerStart := tokenStart - len(marker)
+	if tokenLen < ed25519.SignatureSize || markerStart < 0 {
 		return errors.New("unlock: truncated capability token")
 	}
-	token := plain[off : off+tokenLen]
-	// token layout: payload + 64-byte signature
-	if len(token) < 64 {
-		return errors.New("unlock: invalid capability token")
+	if string(plain[markerStart:tokenStart]) != format.CapabilityMarker {
+		return errors.New("unlock: capability token missing marker")
 	}
-	payload := token[:len(token)-64]
-	sig := token[len(token)-64:]
-	if !ed25519.Verify(ed25519.PublicKey(pub), payload, sig) {
+	token := plain[tokenStart : tokenStart+tokenLen]
+	payload := token[:len(token)-ed25519.SignatureSize]
+	sig := token[len(token)-ed25519.SignatureSize:]
+	if !ed25519.Verify(pub, payload, sig) {
 		return errors.New("unlock: invalid capability signature")
 	}
 	// payload: customer|issued|expires
 	parts := strings.Split(string(payload), "|")
-	if len(parts) >= 3 {
-		exp, err := strconv.ParseInt(parts[2], 10, 64)
-		if err == nil && time.Now().Unix() > exp {
-			return errors.New("unlock: capability expired")
-		}
+	if len(parts) < 3 {
+		return errors.New("unlock: malformed capability token")
+	}
+	exp, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return errors.New("unlock: malformed capability expiry")
+	}
+	if time.Now().Unix() > exp {
+		return errors.New("unlock: capability expired")
 	}
 	return nil
 }

@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -16,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,12 +62,10 @@ func main() {
 		err = batchCmd(args[1:])
 	case args[0] == "completion":
 		err = completionCmd(args[1:])
-	case args[0] == "stego-embed":
-		err = stegoEmbedCmd(args[1:])
-	case args[0] == "stego-extract":
-		err = stegoExtractCmd(args[1:])
-	case args[0] == "menu":
-		err = menuCmd(args[1:])
+	case args[0] == "png-append":
+		err = pngAppendCmd(args[1:])
+	case args[0] == "png-extract":
+		err = pngExtractCmd(args[1:])
 	case args[0] == "audit":
 		err = auditCmd(args[1:])
 	case args[0] == "diff":
@@ -78,8 +74,6 @@ func main() {
 		err = configCmd(args[1:])
 	case args[0] == "version":
 		err = versionCmd(args[1:])
-	case args[0] == "serve":
-		err = serveCmd(args[1:])
 	case args[0] == "selftest":
 		err = selftestCmd(args[1:])
 	case args[0] == "benchmark":
@@ -148,14 +142,12 @@ commands:
   doctor          check the local environment
   batch           pack multiple targets in parallel
   completion      print shell completion script
-  stego-embed     hide an artifact in a PNG cover image
-  stego-extract   recover an artifact from a stego image
-  menu            interactive menu
+  png-append      append an artifact after a PNG's IEND chunk
+  png-extract     recover an artifact appended to a PNG
   audit           scan an artifact for leaked key material
   diff            compare two artifacts
   config          manage configuration
   version         print version info
-  serve           run a tiny capability-token issuer
   selftest        run an end-to-end self test
   benchmark       benchmark pack/verify speed
   watch           watch a directory and repack on change
@@ -375,7 +367,7 @@ func verifyCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	blob, _, err := format.Open(f, info.Size())
+	blob, footer, err := format.Open(f, info.Size())
 	if err != nil {
 		return err
 	}
@@ -411,16 +403,16 @@ func verifyCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	f2, _ := os.Open(*artifact)
-	defer f2.Close()
-	_, footer, _ := format.Open(f2, info.Size())
 	data, err = unlock.ExtractPayload(data, footer)
 	if err != nil {
 		return err
 	}
 	h := sha256.Sum256(data)
 	if *jsonOut {
-		b, _ := json.Marshal(map[string]any{"ok": true, "sha256": hex.EncodeToString(h[:]), "size": len(data)})
+		b, err := json.Marshal(map[string]any{"ok": true, "sha256": hex.EncodeToString(h[:]), "size": len(data)})
+		if err != nil {
+			return err
+		}
 		fmt.Println(string(b))
 	} else {
 		fmt.Printf("verify ok: sha256=%s size=%d\n", hex.EncodeToString(h[:]), len(data))
@@ -453,7 +445,10 @@ func inspectCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	blobBytes, _ := io.ReadAll(blob)
+	blobBytes, err := io.ReadAll(blob)
+	if err != nil {
+		return err
+	}
 	// count stanzas in age header (stops at blank line)
 	stanzas := 0
 	header := string(blobBytes)
@@ -467,12 +462,15 @@ func inspectCmd(args []string) error {
 		}
 	}
 	if *jsonOut {
-		b, _ := json.Marshal(map[string]any{
+		b, err := json.Marshal(map[string]any{
 			"artifact": *artifact, "size": info.Size(), "version": footer.Version,
 			"flags": footer.Flags, "blob_size": footer.BlobSize,
 			"stub_size": info.Size() - int64(footer.BlobSize) - format.Size,
 			"stanzas":   stanzas,
 		})
+		if err != nil {
+			return err
+		}
 		fmt.Println(string(b))
 	} else {
 		fmt.Printf("artifact: %s\n", *artifact)
@@ -547,7 +545,10 @@ func extractCmd(args []string) error {
 	dirs := identityDirs(*sshdir)
 	var identities []age.Identity
 	for _, dir := range dirs {
-		ids, _ := unlock.Identities(dir)
+		ids, err := unlock.Identities(dir)
+		if err != nil {
+			return err
+		}
 		identities = append(identities, ids...)
 	}
 	if len(identities) == 0 {
@@ -592,11 +593,14 @@ func repackCmd(args []string) error {
 		return errors.New(`repack requires -artifact and -out`)
 	}
 	if *decoys < 0 {
-		n, _ := rand.Int(rand.Reader, big.NewInt(25))
+		n, err := rand.Int(rand.Reader, big.NewInt(25))
+		if err != nil {
+			return err
+		}
 		*decoys = 8 + int(n.Int64())
 	}
 
-	// decrypt original
+	// Decrypt the existing artifact.
 	f, err := os.Open(*artifact)
 	if err != nil {
 		return err
@@ -614,7 +618,10 @@ func repackCmd(args []string) error {
 	dirs := identityDirs(*sshdir)
 	var identities []age.Identity
 	for _, dir := range dirs {
-		ids, _ := unlock.Identities(dir)
+		ids, err := unlock.Identities(dir)
+		if err != nil {
+			return err
+		}
 		identities = append(identities, ids...)
 	}
 	if len(identities) == 0 {
@@ -688,7 +695,6 @@ func repackCmd(args []string) error {
 		Recipients: append(recipients, pad...),
 	})
 	os.Remove(stubPath)
-	os.Remove(tmpName)
 	os.Remove(tmpName)
 	if err != nil {
 		return err
@@ -764,7 +770,10 @@ func batchCmd(args []string) error {
 		return err
 	}
 	if *decoys < 0 {
-		n, _ := rand.Int(rand.Reader, big.NewInt(25))
+		n, err := rand.Int(rand.Reader, big.NewInt(25))
+		if err != nil {
+			return err
+		}
 		*decoys = 8 + int(n.Int64())
 	}
 	pad, err := keystore.Decoys(*decoys)
@@ -793,9 +802,22 @@ func batchCmd(args []string) error {
 				fmt.Println("skip", target, err)
 				return
 			}
-			sf, _ := os.CreateTemp("", "self-stub-*")
-			sf.Write(stubData)
-			sf.Close()
+			sf, err := os.CreateTemp("", "self-stub-*")
+			if err != nil {
+				fmt.Println("fail", target, err)
+				return
+			}
+			if _, err := sf.Write(stubData); err != nil {
+				sf.Close()
+				os.Remove(sf.Name())
+				fmt.Println("fail", target, err)
+				return
+			}
+			if err := sf.Close(); err != nil {
+				os.Remove(sf.Name())
+				fmt.Println("fail", target, err)
+				return
+			}
 			err = packer.Pack(packer.Options{
 				Stub:       sf.Name(),
 				Target:     target,
@@ -837,7 +859,7 @@ _self() {
     local cur prev commands
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
-    commands="pack keygen verify inspect extract repack doctor batch completion stego-embed stego-extract"
+    commands="pack keygen verify inspect extract repack doctor batch completion png-append png-extract"
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
         return 0
@@ -858,24 +880,27 @@ _self() {
         'doctor:check environment'
         'batch:pack multiple targets'
         'completion:print completion'
-        'stego-embed:hide artifact in PNG'
-        'stego-extract:recover artifact from PNG'
+        'png-append:append artifact after PNG IEND'
+        'png-extract:recover artifact from PNG'
     )
     _describe 'command' commands
 }
 compdef _self self
 `
-const fishCompletion = `complete -c self -f -a "pack keygen verify inspect extract repack doctor batch completion stego-embed stego-extract"
+const fishCompletion = `complete -c self -f -a "pack keygen verify inspect extract repack doctor batch completion png-append png-extract"
 `
 
-func stegoEmbedCmd(args []string) error {
-	fs := flag.NewFlagSet("self stego-embed", flag.ExitOnError)
-	artifact := fs.String("artifact", "", "artifact to hide (required)")
+// pngAppendCmd writes the artifact immediately after the cover PNG's
+// data. PNG decoders stop at IEND, so the image still renders; the
+// artifact is not hidden or encrypted beyond its normal sealing.
+func pngAppendCmd(args []string) error {
+	fs := flag.NewFlagSet("self png-append", flag.ExitOnError)
+	artifact := fs.String("artifact", "", "artifact to append (required)")
 	cover := fs.String("cover", "", "cover PNG image (required)")
-	out := fs.String("out", "stego.png", "output PNG")
+	out := fs.String("out", "out.png", "output PNG")
 	fs.Parse(args)
 	if *artifact == "" || *cover == "" {
-		return errors.New("stego-embed requires -artifact and -cover")
+		return errors.New("png-append requires -artifact and -cover")
 	}
 	data, err := os.ReadFile(*artifact)
 	if err != nil {
@@ -886,7 +911,7 @@ func stegoEmbedCmd(args []string) error {
 		return err
 	}
 	// Append marker + artifact to the PNG (PNG readers ignore trailing data).
-	marker := []byte("SELF-STEGO")
+	marker := []byte("SELF-PNG")
 	outData := append([]byte{}, img...)
 	outData = append(outData, marker...)
 	outData = append(outData, data...)
@@ -897,19 +922,19 @@ func stegoEmbedCmd(args []string) error {
 	return nil
 }
 
-func stegoExtractCmd(args []string) error {
-	fs := flag.NewFlagSet("self stego-extract", flag.ExitOnError)
-	stego := fs.String("in", "", "stego PNG (required)")
+func pngExtractCmd(args []string) error {
+	fs := flag.NewFlagSet("self png-extract", flag.ExitOnError)
+	in := fs.String("in", "", "PNG with an appended artifact (required)")
 	out := fs.String("out", "", "output artifact (required)")
 	fs.Parse(args)
-	if *stego == "" || *out == "" {
-		return errors.New("stego-extract requires -in and -out")
+	if *in == "" || *out == "" {
+		return errors.New("png-extract requires -in and -out")
 	}
-	data, err := os.ReadFile(*stego)
+	data, err := os.ReadFile(*in)
 	if err != nil {
 		return err
 	}
-	marker := []byte("SELF-STEGO")
+	marker := []byte("SELF-PNG")
 	idx := bytes.Index(data, marker)
 	if idx < 0 {
 		return errors.New("no embedded artifact found")
@@ -920,30 +945,6 @@ func stegoExtractCmd(args []string) error {
 	}
 	fmt.Printf("extracted %d bytes to %s\n", len(payload), *out)
 	return nil
-}
-
-func menuCmd(args []string) error {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Println("\nself menu:")
-		fmt.Println("  1) doctor")
-		fmt.Println("  2) keygen")
-		fmt.Println("  3) pack")
-		fmt.Println("  4) verify")
-		fmt.Println("  5) inspect")
-		fmt.Println("  6) quit")
-		fmt.Print("choice: ")
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-		switch line {
-		case "1":
-			doctorCmd(nil)
-		case "6", "q", "quit":
-			return nil
-		default:
-			fmt.Println("not implemented in menu; use CLI flags")
-		}
-	}
 }
 
 func auditCmd(args []string) error {
@@ -960,9 +961,15 @@ func auditCmd(args []string) error {
 	}
 	issues := 0
 	// check each public key's raw bytes
-	paths, _ := filepath.Glob(filepath.Join(*keys, "*.pub"))
+	paths, err := filepath.Glob(filepath.Join(*keys, "*.pub"))
+	if err != nil {
+		return err
+	}
 	for _, path := range paths {
-		pub, _ := os.ReadFile(path)
+		pub, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
 		key, _, _, _, err := ssh.ParseAuthorizedKey(pub)
 		if err != nil {
 			continue
@@ -997,14 +1004,32 @@ func diffCmd(args []string) error {
 	if *a == "" || *b == "" {
 		return errors.New("diff requires -a and -b")
 	}
-	infoA, _ := os.Stat(*a)
-	infoB, _ := os.Stat(*b)
-	fA, _ := os.Open(*a)
+	infoA, err := os.Stat(*a)
+	if err != nil {
+		return err
+	}
+	infoB, err := os.Stat(*b)
+	if err != nil {
+		return err
+	}
+	fA, err := os.Open(*a)
+	if err != nil {
+		return err
+	}
 	defer fA.Close()
-	fB, _ := os.Open(*b)
+	fB, err := os.Open(*b)
+	if err != nil {
+		return err
+	}
 	defer fB.Close()
-	_, fa, _ := format.Open(fA, infoA.Size())
-	_, fb, _ := format.Open(fB, infoB.Size())
+	_, fa, err := format.Open(fA, infoA.Size())
+	if err != nil {
+		return err
+	}
+	_, fb, err := format.Open(fB, infoB.Size())
+	if err != nil {
+		return err
+	}
 	fmt.Printf("metric          %s  %s\n", filepath.Base(*a), filepath.Base(*b))
 	fmt.Printf("size            %d  %d\n", infoA.Size(), infoB.Size())
 	fmt.Printf("version         %d  %d\n", fa.Version, fb.Version)
@@ -1014,24 +1039,31 @@ func diffCmd(args []string) error {
 }
 
 func configCmd(args []string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".config", "self", "config.json")
 	if len(args) > 0 && args[0] == "init" {
-		home, _ := os.UserHomeDir()
-		dir := filepath.Join(home, ".config", "self")
-		os.MkdirAll(dir, 0o755)
-		path := filepath.Join(dir, "config.json")
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("config already exists: %s", path)
 		}
 		cfg := map[string]any{"keys": "keys", "decoys": 16, "ssh_dir": filepath.Join(home, ".ssh")}
-		data, _ := json.MarshalIndent(cfg, "", "  ")
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return err
+		}
 		if err := os.WriteFile(path, data, 0o644); err != nil {
 			return err
 		}
 		fmt.Println("wrote", path)
 		return nil
 	}
-	home, _ := os.UserHomeDir()
-	fmt.Println(filepath.Join(home, ".config", "self", "config.json"))
+	fmt.Println(path)
 	return nil
 }
 
@@ -1040,100 +1072,75 @@ func versionCmd(args []string) error {
 	return nil
 }
 
-func serveCmd(args []string) error {
-	fs := flag.NewFlagSet("self serve", flag.ExitOnError)
-	key := fs.String("issuer-key", "", "issuer signing key (required)")
-	port := fs.String("port", "8080", "listen port")
-	fs.Parse(args)
-	if *key == "" {
-		return errors.New("serve requires -issuer-key")
-	}
-	seedHex, err := os.ReadFile(*key)
-	if err != nil {
-		return err
-	}
-	seed, err := hex.DecodeString(strings.TrimSpace(string(seedHex)))
-	if err != nil {
-		return err
-	}
-	priv := ed25519.NewKeyFromSeed(seed)
-	pub := priv.Public().(ed25519.PublicKey)
-
-	http.HandleFunc("/pubkey", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(hex.EncodeToString(pub)))
-	})
-	http.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		customer := r.URL.Query().Get("customer")
-		durStr := r.URL.Query().Get("expires")
-		dur := 8760 * time.Hour
-		if durStr != "" {
-			if d, err := time.ParseDuration(durStr); err == nil {
-				dur = d
-			}
-		}
-		now := time.Now()
-		payload := fmt.Sprintf("%s|%d|%d", customer, now.Unix(), now.Add(dur).Unix())
-		sig := ed25519.Sign(priv, []byte(payload))
-		token := append([]byte(payload), sig...)
-		w.Write([]byte(hex.EncodeToString(token)))
-	})
-	fmt.Printf("serving on :%s\n", *port)
-	return http.ListenAndServe(":"+*port, nil)
-}
-
 func selftestCmd(args []string) error {
-	tmp, _ := os.MkdirTemp("", "self-selftest-")
+	tmp, err := os.MkdirTemp("", "self-selftest-")
+	if err != nil {
+		return err
+	}
 	defer os.RemoveAll(tmp)
 	keys := filepath.Join(tmp, "keys")
 	ssh := filepath.Join(tmp, "ssh")
-	os.MkdirAll(ssh, 0o700)
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		return err
+	}
 	if err := keystore.Generate(keys, "alice"); err != nil {
 		return err
 	}
-	id, _ := os.ReadFile(filepath.Join(keys, "alice.id"))
-	os.WriteFile(filepath.Join(ssh, "id_ed25519"), id, 0o600)
+	id, err := os.ReadFile(filepath.Join(keys, "alice.id"))
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(ssh, "id_ed25519"), id, 0o600); err != nil {
+		return err
+	}
 	// build hello
 	hello := filepath.Join(tmp, "hello")
 	if err := exec.Command("go", "build", "-o", hello, "./testdata/hello").Run(); err != nil {
-		// try from module root
 		c := exec.Command("go", "build", "-o", hello, "testdata/hello")
-		c.Dir = "."
 		if err := c.Run(); err != nil {
 			return err
 		}
 	}
-	artifact := filepath.Join(tmp, "hello.locked")
-	if err := packer.Pack(packer.Options{
-		Target: hello,
-		Out:    artifact,
-		Recipients: func() []age.Recipient {
-			r, _ := keystore.Load(keys)
-			p, _ := keystore.Decoys(2)
-			return append(r, p...)
-		}(),
-	}); err != nil {
-		// resolve stub
-		platform, _ := packer.Platform(hello)
-		sd, _ := stubs.Lookup(platform)
-		sf, _ := os.CreateTemp("", "stub-*")
-		sf.Write(sd)
-		sf.Close()
-		if err := packer.Pack(packer.Options{
-			Stub:   sf.Name(),
-			Target: hello,
-			Out:    artifact,
-			Recipients: func() []age.Recipient {
-				r, _ := keystore.Load(keys)
-				p, _ := keystore.Decoys(2)
-				return append(r, p...)
-			}(),
-		}); err != nil {
-			os.Remove(sf.Name())
-			return err
-		}
-		os.Remove(sf.Name())
+	recipients, err := keystore.Load(keys)
+	if err != nil {
+		return err
 	}
-	// verify
+	pad, err := keystore.Decoys(2)
+	if err != nil {
+		return err
+	}
+	platform, err := packer.Platform(hello)
+	if err != nil {
+		return err
+	}
+	sd, err := stubs.Lookup(platform)
+	if err != nil {
+		return err
+	}
+	sf, err := os.CreateTemp("", "stub-*")
+	if err != nil {
+		return err
+	}
+	if _, err := sf.Write(sd); err != nil {
+		sf.Close()
+		os.Remove(sf.Name())
+		return err
+	}
+	if err := sf.Close(); err != nil {
+		os.Remove(sf.Name())
+		return err
+	}
+	artifact := filepath.Join(tmp, "hello.locked")
+	err = packer.Pack(packer.Options{
+		Stub:       sf.Name(),
+		Target:     hello,
+		Out:        artifact,
+		Recipients: append(recipients, pad...),
+	})
+	os.Remove(sf.Name())
+	if err != nil {
+		return err
+	}
 	cmd := exec.Command(artifact)
 	cmd.Env = append(os.Environ(), "SELF_SSH_DIR="+ssh)
 	out, err := cmd.CombinedOutput()
@@ -1155,23 +1162,55 @@ func benchmarkCmd(args []string) error {
 	if *target == "" {
 		return errors.New("benchmark requires -target")
 	}
-	tmp, _ := os.MkdirTemp("", "self-bench-")
+	tmp, err := os.MkdirTemp("", "self-bench-")
+	if err != nil {
+		return err
+	}
 	defer os.RemoveAll(tmp)
 	artifact := filepath.Join(tmp, "bench.locked")
 	ssh := filepath.Join(tmp, "ssh")
-	os.MkdirAll(ssh, 0o700)
-	id, _ := os.ReadFile(filepath.Join(*keys, "alice.id"))
-	os.WriteFile(filepath.Join(ssh, "id_ed25519"), id, 0o600)
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		return err
+	}
+	id, err := os.ReadFile(filepath.Join(*keys, "alice.id"))
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(ssh, "id_ed25519"), id, 0o600); err != nil {
+		return err
+	}
 
 	start := time.Now()
-	recipients, _ := keystore.Load(*keys)
-	pad, _ := keystore.Decoys(4)
-	platform, _ := packer.Platform(*target)
-	sd, _ := stubs.Lookup(platform)
-	sf, _ := os.CreateTemp("", "stub-*")
-	sf.Write(sd)
-	sf.Close()
-	err := packer.Pack(packer.Options{
+	recipients, err := keystore.Load(*keys)
+	if err != nil {
+		return err
+	}
+	pad, err := keystore.Decoys(4)
+	if err != nil {
+		return err
+	}
+	platform, err := packer.Platform(*target)
+	if err != nil {
+		return err
+	}
+	sd, err := stubs.Lookup(platform)
+	if err != nil {
+		return err
+	}
+	sf, err := os.CreateTemp("", "stub-*")
+	if err != nil {
+		return err
+	}
+	if _, err := sf.Write(sd); err != nil {
+		sf.Close()
+		os.Remove(sf.Name())
+		return err
+	}
+	if err := sf.Close(); err != nil {
+		os.Remove(sf.Name())
+		return err
+	}
+	err = packer.Pack(packer.Options{
 		Stub:       sf.Name(),
 		Target:     *target,
 		Out:        artifact,
@@ -1186,7 +1225,9 @@ func benchmarkCmd(args []string) error {
 	start = time.Now()
 	cmd := exec.Command(artifact)
 	cmd.Env = append(os.Environ(), "SELF_SSH_DIR="+ssh)
-	cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("benchmark: run artifact: %w", err)
+	}
 	verifyTime := time.Since(start)
 
 	fmt.Printf("pack:   %v\n", packTime)
@@ -1201,35 +1242,73 @@ func watchCmd(args []string) error {
 	keys := fs.String("keys", "keys", "keys dir")
 	interval := fs.Duration("interval", 2*time.Second, "poll interval")
 	fs.Parse(args)
-	os.MkdirAll(*out, 0o755)
+	if err := os.MkdirAll(*out, 0o755); err != nil {
+		return err
+	}
 	fmt.Println("watching", *dir, "->", *out, "(Ctrl-C to stop)")
 	seen := map[string]time.Time{}
 	for {
-		entries, _ := os.ReadDir(*dir)
+		entries, err := os.ReadDir(*dir)
+		if err != nil {
+			return err
+		}
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
-			info, _ := e.Info()
+			info, err := e.Info()
+			if err != nil {
+				fmt.Println("skip", e.Name(), err)
+				continue
+			}
+			// Only files with an execute bit can become artifacts;
+			// packer.Platform also rejects formats without a loader.
+			if info.Mode().Perm()&0o111 == 0 {
+				continue
+			}
 			path := filepath.Join(*dir, e.Name())
 			if t, ok := seen[path]; ok && !info.ModTime().After(t) {
 				continue
 			}
 			seen[path] = info.ModTime()
-			// only pack executables? pack all files
 			outPath := filepath.Join(*out, e.Name()+".locked")
 			fmt.Println("change detected:", e.Name())
-			recipients, _ := keystore.Load(*keys)
-			pad, _ := keystore.Decoys(2)
+			recipients, err := keystore.Load(*keys)
+			if err != nil {
+				fmt.Println("fail", err)
+				continue
+			}
+			pad, err := keystore.Decoys(2)
+			if err != nil {
+				fmt.Println("fail", err)
+				continue
+			}
 			platform, err := packer.Platform(path)
 			if err != nil {
 				fmt.Println("skip", err)
 				continue
 			}
-			sd, _ := stubs.Lookup(platform)
-			sf, _ := os.CreateTemp("", "stub-*")
-			sf.Write(sd)
-			sf.Close()
+			sd, err := stubs.Lookup(platform)
+			if err != nil {
+				fmt.Println("fail", err)
+				continue
+			}
+			sf, err := os.CreateTemp("", "stub-*")
+			if err != nil {
+				fmt.Println("fail", err)
+				continue
+			}
+			if _, err := sf.Write(sd); err != nil {
+				sf.Close()
+				os.Remove(sf.Name())
+				fmt.Println("fail", err)
+				continue
+			}
+			if err := sf.Close(); err != nil {
+				os.Remove(sf.Name())
+				fmt.Println("fail", err)
+				continue
+			}
 			if err := packer.Pack(packer.Options{
 				Stub:       sf.Name(),
 				Target:     path,

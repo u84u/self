@@ -3,6 +3,7 @@ package packer
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -33,7 +34,10 @@ type Options struct {
 	// Env is a list of KEY=VALUE strings injected into the payload's
 	// environment at launch.
 	Env []string
-	// Capability token (issuer-signed) appended to the payload.
+	// Capability is set when an issuer-signed token is appended to the
+	// payload. IssuerPubKey is used only to verify the token before
+	// packing; it is not written into the artifact, because a key the
+	// payload carries cannot authorize the payload.
 	Capability      bool
 	IssuerPubKey    []byte
 	CapabilityToken []byte
@@ -57,11 +61,16 @@ func Pack(o Options) (err error) {
 		return errors.New("packer: no recipients")
 	}
 	if o.Capability {
-		if len(o.IssuerPubKey) != 32 {
+		if len(o.IssuerPubKey) != ed25519.PublicKeySize {
 			return errors.New("packer: invalid issuer public key")
 		}
-		if len(o.CapabilityToken) < 64 {
+		if len(o.CapabilityToken) < ed25519.SignatureSize {
 			return errors.New("packer: invalid capability token")
+		}
+		payload := o.CapabilityToken[:len(o.CapabilityToken)-ed25519.SignatureSize]
+		sig := o.CapabilityToken[len(o.CapabilityToken)-ed25519.SignatureSize:]
+		if !ed25519.Verify(ed25519.PublicKey(o.IssuerPubKey), payload, sig) {
+			return errors.New("packer: capability token is not signed by the issuer key")
 		}
 	}
 	stubImage, err := inspect(o.Stub)
@@ -210,19 +219,17 @@ func writeArtifact(out *os.File, o Options) error {
 		}
 	}
 	if o.Capability {
-		marker := []byte("SELF-CAP")
-		if _, err := w.Write(marker); err != nil {
+		// marker | token | token length, so the stub can read the
+		// token from the end without scanning for the marker.
+		if _, err := w.Write([]byte(format.CapabilityMarker)); err != nil {
 			return fmt.Errorf("packer: seal payload: %w", err)
 		}
-		if _, err := w.Write(o.IssuerPubKey); err != nil {
+		if _, err := w.Write(o.CapabilityToken); err != nil {
 			return fmt.Errorf("packer: seal payload: %w", err)
 		}
 		var l [4]byte
 		binary.LittleEndian.PutUint32(l[:], uint32(len(o.CapabilityToken)))
 		if _, err := w.Write(l[:]); err != nil {
-			return fmt.Errorf("packer: seal payload: %w", err)
-		}
-		if _, err := w.Write(o.CapabilityToken); err != nil {
 			return fmt.Errorf("packer: seal payload: %w", err)
 		}
 		flags |= format.FlagCapability

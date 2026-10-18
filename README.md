@@ -28,6 +28,17 @@ the issuer's `keys/` directory and never ships.
 `make stubs` alone rebuilds the gzipped loaders (linux/amd64+arm64,
 darwin/amd64+arm64, windows/amd64+386) that `make` embeds into `self`.
 
+Capability tokens are optional and off unless the loader can check
+them. Build the loaders with the issuer's Ed25519 public key compiled
+in, then rebuild `self`:
+
+    ISSUER_PUBKEY=<64 hex chars> make stubs
+    make
+
+The stub verifies a token against that compiled-in key, never against a
+key carried by the artifact. Without a compiled-in key, an artifact that
+sets the capability flag refuses to launch.
+
 ## Use
 
     build/self keygen -keys keys -name alice        # test pair; the customer sends you their alice.pub
@@ -73,3 +84,6 @@ conversations with customers that run endpoint security.
   bypassed; treat them as licensing hints, not enforcement.
 - `SELF_DEBUG=1` prints underlying failure reasons to stderr; leave it
   unset in production to keep the crash silent.
+- `SELF_ANTI_DEBUG=1` enables the TracerPid probe and the seccomp filter
+  that blocks `ptrace` and `process_vm_*`. Both are off by default
+  because endpoint security products treat that behavior as malware.
